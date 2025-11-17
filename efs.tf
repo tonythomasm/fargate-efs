@@ -69,8 +69,10 @@ resource "aws_efs_file_system" "efs" {
 }
 
 # Create an Access Point for each filesystem to isolate directory per namespace
+# Only for Fargate (EC2 can mount EFS directly without access points)
 resource "aws_efs_access_point" "ap" {
-  for_each       = aws_efs_file_system.efs
+  for_each       = var.use_fargate ? aws_efs_file_system.efs : {}
+  # for_each       = aws_efs_file_system.efs
   file_system_id = each.value.id
 
   posix_user {
@@ -93,21 +95,35 @@ resource "aws_efs_access_point" "ap" {
 }
 
 # Create mount targets: one per filesystem per subnet (ensures EFS is reachable in each AZ)
+# Using count instead of for_each to avoid dynamic key issues
 locals {
-  pairs = flatten([for ns in var.namespaces: [for sid in aws_subnet.private[*].id: "${ns}|${sid}"]])
+  mount_target_configs = var.use_fargate ? flatten([
+    for ns in var.namespaces : [
+      for idx, subnet_id in aws_subnet.private[*].id : {
+        namespace = ns
+        subnet_id = subnet_id
+        index     = "${ns}-${idx}"
+      }
+    ]
+  ]) : []
 }
-resource "aws_efs_mount_target" "mt" {
-    for_each = { for p in local.pairs : p => p }
 
-    file_system_id  = aws_efs_file_system.efs[split("|", each.key)[0]].id
-    subnet_id       = split("|", each.key)[1]
-    security_groups = [aws_security_group.efs_sg[split("|", each.key)[0]].id]
+resource "aws_efs_mount_target" "mt" {
+  count              = length(local.mount_target_configs)
+  file_system_id     = aws_efs_file_system.efs[local.mount_target_configs[count.index].namespace].id
+  subnet_id          = local.mount_target_configs[count.index].subnet_id
+  security_groups    = [aws_security_group.efs_sg[local.mount_target_configs[count.index].namespace].id]
 }
 
 output "fs_id" {
-        value = { for k, v in aws_efs_file_system.efs : k => v.id }
+  value = { for k, v in aws_efs_file_system.efs : k => v.id }
 }
 
 output "fs_access_point_id" {
-        value = { for k, v in aws_efs_access_point.ap : k => v.id }
+  # value = var.use_fargate ? { for k, v in aws_efs_access_point.ap : k => v.id } : {}
+  value = { for k, v in aws_efs_access_point.ap : k => v.id }
+}
+
+output "mount_targets" {
+  value = var.use_fargate ? [for mt in aws_efs_mount_target.mt : mt.id] : []
 }
